@@ -13,8 +13,15 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100
 app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
-    const ok = [/\.github\.io$/, /\.netlify\.app$/, /\.vercel\.app$/, /localhost/].some(p => p.test(origin));
-    cb(ok ? null : new Error('CORS blocked'), ok);
+    const allowed = [
+      'https://tonymcsauce.github.io',
+      /\.github\.io$/,
+      /\.netlify\.app$/,
+      /\.vercel\.app$/,
+      /localhost/,
+    ];
+    const ok = allowed.some(p => typeof p === 'string' ? origin === p || origin.startsWith(p) : p.test(origin));
+    cb(ok ? null : new Error('CORS blocked: ' + origin), ok);
   }
 }));
 app.use(express.json());
