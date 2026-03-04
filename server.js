@@ -10,20 +10,8 @@ const os       = require('os');
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    const allowed = [
-      'https://tonymcsauce.github.io',
-      /\.github\.io$/,
-      /\.netlify\.app$/,
-      /\.vercel\.app$/,
-      /localhost/,
-    ];
-    const ok = allowed.some(p => typeof p === 'string' ? origin === p || origin.startsWith(p) : p.test(origin));
-    cb(ok ? null : new Error('CORS blocked: ' + origin), ok);
-  }
-}));
+app.use(cors());
+app.options('*', cors());
 app.use(express.json());
 
 function cleanup(dir) {
