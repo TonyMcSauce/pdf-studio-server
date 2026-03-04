@@ -1,20 +1,19 @@
-FROM node:20-slim
+FROM node:20-bookworm
 
 RUN apt-get update && \
     apt-get install -y \
       libreoffice \
-      libreoffice-writer \
-      libreoffice-calc \
-      libreoffice-impress \
+      libreoffice-java-common \
+      default-jre-headless \
       libreoffice-pdfimport \
       fonts-liberation \
+      fonts-dejavu \
       fontconfig \
       --no-install-recommends && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /home/appuser && chmod 777 /home/appuser
-RUN mkdir -p /tmp && chmod 777 /tmp
+RUN mkdir -p /home/appuser/.config /home/appuser/.local && chmod -R 777 /home/appuser
 ENV HOME=/home/appuser
 
 WORKDIR /app

@@ -88,7 +88,14 @@ function convertWithLibreOffice(pdfBuffer, format) {
 
     console.log(`[cmd] ${cmd}`);
 
-    exec(cmd, { timeout: 120000, env: { ...process.env, HOME: tmpDir } }, (err, stdout, stderr) => {
+    exec(cmd, { 
+      timeout: 120000, 
+      env: { 
+        ...process.env, 
+        HOME: tmpDir,
+        JAVA_HOME: process.env.JAVA_HOME || '/usr/lib/jvm/default-java',
+      } 
+    }, (err, stdout, stderr) => {
       console.log(`[stdout] ${stdout}`);
       if (stderr) console.log(`[stderr] ${stderr}`);
 
