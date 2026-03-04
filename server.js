@@ -40,13 +40,20 @@ app.get('/', (req, res) => {
 
 // ── LIBREOFFICE DETECTION ─────────────────────────────────────────────────────
 function getLibreOfficePath() {
+  // Try these in order — Docker container has it at /usr/bin/libreoffice
   const candidates = [
-    'libreoffice',        // Linux (Render)
-    'soffice',            // alternative name
     '/usr/bin/libreoffice',
+    '/usr/bin/soffice',
     '/usr/lib/libreoffice/program/soffice',
+    'libreoffice',
+    'soffice',
   ];
-  return candidates[0]; // exec will fail gracefully if not found
+  for (const p of candidates) {
+    try {
+      if (p.startsWith('/') && fs.existsSync(p)) return p;
+    } catch (_) {}
+  }
+  return candidates[0]; // fallback
 }
 
 // ── CONVERT HELPER ────────────────────────────────────────────────────────────
@@ -59,18 +66,22 @@ function convertWithLibreOffice(pdfBuffer, format) {
     fs.writeFileSync(inFile, pdfBuffer);
 
     const lo = getLibreOfficePath();
+    // Each conversion gets its own profile dir — prevents LibreOffice lock conflicts
+    const profileDir = path.join(tmpDir, 'lo-profile');
+    fs.mkdirSync(profileDir);
+    const loEnv = `-env:UserInstallation=file://${profileDir}`;
 
     // Each format needs the right --convert-to filter string.
     // For docx/xlsx: no --infilter needed — LibreOffice auto-detects PDF.
     // For pptx: use the Impress PDF import filter.
     let cmd;
     if (format === 'pptx') {
-      cmd = `${lo} --headless --infilter="impress_pdf_import" --convert-to pptx --outdir "${tmpDir}" "${inFile}"`;
+      cmd = `${lo} --headless ${loEnv} --infilter="impress_pdf_import" --convert-to pptx --outdir "${tmpDir}" "${inFile}"`;
     } else if (format === 'xlsx') {
-      cmd = `${lo} --headless --convert-to xlsx:"Calc MS Excel 2007 XML" --outdir "${tmpDir}" "${inFile}"`;
+      cmd = `${lo} --headless ${loEnv} --convert-to xlsx:"Calc MS Excel 2007 XML" --outdir "${tmpDir}" "${inFile}"`;
     } else {
       // docx
-      cmd = `${lo} --headless --convert-to docx:"MS Word 2007 XML" --outdir "${tmpDir}" "${inFile}"`;
+      cmd = `${lo} --headless ${loEnv} --convert-to docx:"MS Word 2007 XML" --outdir "${tmpDir}" "${inFile}"`;
     }
 
     console.log(`[cmd] ${cmd}`);
@@ -113,7 +124,26 @@ const MIME = {
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 };
 
-// ── CONVERSION ENDPOINTS ──────────────────────────────────────────────────────
+// ── TEST ENDPOINT ─────────────────────────────────────────────────────────────
+// GET /test — checks LibreOffice is installed and returns its version
+app.get('/test', (req, res) => {
+  const lo = getLibreOfficePath();
+  exec(`${lo} --version`, { timeout: 15000 }, (err, stdout, stderr) => {
+    if (err) {
+      return res.status(500).json({
+        ok: false,
+        error: err.message,
+        stderr,
+        tried: lo,
+      });
+    }
+    res.json({
+      ok: true,
+      libreoffice: stdout.trim(),
+      path: lo,
+    });
+  });
+});
 
 // POST /convert/word   → PDF → DOCX
 // POST /convert/excel  → PDF → XLSX
