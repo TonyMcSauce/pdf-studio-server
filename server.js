@@ -50,41 +50,52 @@ function getLibreOfficePath() {
 }
 
 // ── CONVERT HELPER ────────────────────────────────────────────────────────────
-/**
- * Converts a PDF buffer to the target format using LibreOffice.
- * format: 'docx' | 'xlsx' | 'pptx'
- * Returns a Buffer of the converted file.
- */
 function convertWithLibreOffice(pdfBuffer, format) {
   return new Promise((resolve, reject) => {
-    // Write PDF to a temp file
     const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'pdfconv-'));
     const inFile  = path.join(tmpDir, 'input.pdf');
     const outFile = path.join(tmpDir, `input.${format}`);
 
     fs.writeFileSync(inFile, pdfBuffer);
 
-    // Map format to LibreOffice filter name
-    const filterMap = {
-      docx: 'docx',
-      xlsx: 'xlsx',
-      pptx: 'pptx',
-    };
-    const filter = filterMap[format] || format;
-    const lo     = getLibreOfficePath();
-    const cmd    = `${lo} --headless --infilter="impress_pdf_import" --convert-to ${filter} --outdir "${tmpDir}" "${inFile}"`;
+    const lo = getLibreOfficePath();
 
-    // Timeout: 2 minutes
+    // Each format needs the right --convert-to filter string.
+    // For docx/xlsx: no --infilter needed — LibreOffice auto-detects PDF.
+    // For pptx: use the Impress PDF import filter.
+    let cmd;
+    if (format === 'pptx') {
+      cmd = `${lo} --headless --infilter="impress_pdf_import" --convert-to pptx --outdir "${tmpDir}" "${inFile}"`;
+    } else if (format === 'xlsx') {
+      cmd = `${lo} --headless --convert-to xlsx:"Calc MS Excel 2007 XML" --outdir "${tmpDir}" "${inFile}"`;
+    } else {
+      // docx
+      cmd = `${lo} --headless --convert-to docx:"MS Word 2007 XML" --outdir "${tmpDir}" "${inFile}"`;
+    }
+
+    console.log(`[cmd] ${cmd}`);
+
     exec(cmd, { timeout: 120000 }, (err, stdout, stderr) => {
+      console.log(`[stdout] ${stdout}`);
+      if (stderr) console.log(`[stderr] ${stderr}`);
+
       if (err) {
         cleanup(tmpDir);
         return reject(new Error(`LibreOffice error: ${stderr || err.message}`));
       }
-      if (!fs.existsSync(outFile)) {
+
+      // LibreOffice sometimes writes the file with a different name — scan the dir
+      const files = fs.readdirSync(tmpDir).filter(f => f !== 'input.pdf');
+      console.log(`[output files] ${files.join(', ') || 'none'}`);
+
+      const outActual = files.length ? path.join(tmpDir, files[0]) : outFile;
+
+      if (!fs.existsSync(outActual)) {
         cleanup(tmpDir);
-        return reject(new Error('Conversion produced no output file'));
+        return reject(new Error('Conversion produced no output file. The PDF may be scanned/image-only or corrupted.'));
       }
-      const result = fs.readFileSync(outFile);
+
+      const result = fs.readFileSync(outActual);
       cleanup(tmpDir);
       resolve(result);
     });
