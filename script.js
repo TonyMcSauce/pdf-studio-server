@@ -1365,56 +1365,62 @@ const SERVER_URL = 'https://pdf-studio-server-1.onrender.com';
     if (!storedFile) return;
     $(btnId).disabled = true;
 
-    // Step 1: ping the server to wake it up (Render free tier sleeps after 15 min)
+    // Step 1: ping to wake server (Render free tier sleeps after 15 min)
     setStatus('working', '⏳ Waking up server…');
     try {
-      await fetch(`${SERVER_URL}/ping`, { method: 'GET', mode: 'cors', signal: AbortSignal.timeout(15000) });
+      await fetch(`${SERVER_URL}/ping`, { method: 'GET', mode: 'cors', signal: AbortSignal.timeout(20000) });
     } catch (_) {
-      // Ping failed — server still starting. Wait and continue anyway.
-      await new Promise(r => setTimeout(r, 3000));
+      await new Promise(r => setTimeout(r, 4000));
     }
 
-    // Step 2: convert
-    setStatus('working', `Converting to ${label}… please wait`);
+    // Step 2: convert — server streams keep-alive spaces then ends with JSON
+    setStatus('working', `⚙ Converting to ${label}… please wait`);
     try {
       const formData = new FormData();
       formData.append('file', storedFile, storedFile.name);
 
       let res;
-      // Retry once after 5s if first attempt fails (handles cold-start CORS race)
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
           res = await fetch(`${SERVER_URL}${endpoint}`, {
             method: 'POST',
-            body: formData,
-            mode: 'cors',
-            signal: AbortSignal.timeout(120000),
+            body:   formData,
+            mode:   'cors',
+            signal: AbortSignal.timeout(180000), // 3 min max
           });
-          break; // success
+          break;
         } catch (fetchErr) {
           if (attempt === 2) throw fetchErr;
-          setStatus('working', `Server waking up… retrying in 5s (attempt ${attempt}/2)`);
+          setStatus('working', `Retrying… (attempt ${attempt}/2)`);
           await new Promise(r => setTimeout(r, 5000));
         }
       }
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: `Server error ${res.status}` }));
-        throw new Error(err.error || `Server error ${res.status}`);
-      }
-      const blob = await res.blob();
-      const outName = storedFile.name.replace(/\.pdf$/i, '') + '.' + ext;
-      const url = URL.createObjectURL(blob);
-      const a = Object.assign(document.createElement('a'), { href: url, download: outName });
+      // Server always returns 200 with JSON (even on errors), because
+      // it uses chunked streaming — parse the text and trim whitespace/spaces
+      const raw  = await res.text();
+      const json = JSON.parse(raw.trim());
+
+      if (!json.ok) throw new Error(json.error || `Conversion failed`);
+
+      // Decode base64 → Blob → download
+      const byteChars = atob(json.data);
+      const byteArr   = new Uint8Array(byteChars.length);
+      for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
+      const blob   = new Blob([byteArr], { type: json.mime });
+      const url    = URL.createObjectURL(blob);
+      const a      = Object.assign(document.createElement('a'), { href: url, download: json.filename });
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 15000);
+
       setStatus('done', `✓ Converted successfully — check your downloads`);
       toast(`${label} file downloaded!`, 'success');
+
     } catch (err) {
-      console.error(err);
-      const isCors = err.message.toLowerCase().includes('fetch') || err.message.includes('Failed to fetch') || err.name === 'TypeError';
+      console.error('[convert]', err);
+      const isCors = err.name === 'TypeError' || err.message.includes('fetch');
       const msg = isCors
-        ? 'Could not reach server. Try clicking Convert again — it may need another moment to start.'
+        ? 'Connection failed. Click Convert again — server may need another moment.'
         : err.message;
       setStatus('fail', `✗ ${msg}`);
       toast(msg, 'error', 7000);

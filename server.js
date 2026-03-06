@@ -1,7 +1,6 @@
 'use strict';
 const express  = require('express');
 const multer   = require('multer');
-const cors     = require('cors');
 const { exec } = require('child_process');
 const fs       = require('fs');
 const path     = require('path');
@@ -10,7 +9,9 @@ const os       = require('os');
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
-// ── CORS — must be first, before everything else ──
+// ── CORS — set manually on EVERY response ──────────────────────────────────
+// Render's proxy strips cors() middleware headers on error responses (502 etc).
+// Hardcoding headers in a global middleware is the only reliable fix.
 const ALLOWED_ORIGINS = [
   'https://tonymcsauce.github.io',
   'http://localhost:3000',
@@ -18,121 +19,129 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:5500',
 ];
 
-const corsOptions = {
-  origin: (origin, cb) => {
-    // Allow requests with no origin (curl, Postman, server-to-server)
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS: origin ${origin} not allowed`));
-  },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Accept'],
-  exposedHeaders: ['Content-Disposition'],
-  credentials: false,
-  optionsSuccessStatus: 200, // IE11 chokes on 204
-};
+function setCors(req, res) {
+  const origin  = req.headers.origin;
+  const allowed = !origin || ALLOWED_ORIGINS.includes(origin);
+  res.set('Access-Control-Allow-Origin',   allowed ? (origin || '*') : 'null');
+  res.set('Access-Control-Allow-Methods',  'GET, POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers',  'Content-Type, Accept, X-Requested-With');
+  res.set('Access-Control-Expose-Headers', 'Content-Disposition');
+  res.set('Vary', 'Origin');
+}
 
-// Handle ALL OPTIONS preflight requests immediately — before multer, before anything
+// Answer preflight immediately — before Render proxy can interfere
 app.options('*', (req, res) => {
-  const origin = req.headers.origin;
-  if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-    res.set('Access-Control-Allow-Origin', origin || '*');
-  }
-  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
-  res.set('Access-Control-Max-Age', '86400'); // cache preflight for 24h
+  setCors(req, res);
+  res.set('Access-Control-Max-Age', '86400');
   res.sendStatus(200);
 });
 
-app.use(cors(corsOptions));
+// Inject CORS on every request
+app.use((req, res, next) => { setCors(req, res); next(); });
 app.use(express.json());
 
-// ── Keep-alive ping endpoint (call from frontend every 10 min to prevent spin-down) ──
-app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
-
-
+// ── Helpers ───────────────────────────────────────────────────────────────
 function cleanup(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'PDF Studio Server', version: '2.0.0' }));
-
-app.get('/test', (req, res) => {
-  exec('python3 --version && python3 -c "import pdf2docx; print(\'pdf2docx ok\')"', (err, stdout, stderr) => {
-    res.json({ ok: !err, python: stdout.trim(), error: err?.message, stderr: stderr?.trim() });
-  });
-});
-
 const MIME = {
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 };
 
-app.post('/convert/word', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
-  if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'PDF only.' });
+// ── Streaming converter ───────────────────────────────────────────────────
+// Render free tier kills idle connections after ~25s.
+// Fix: open a chunked stream immediately and send a space byte every 5s
+// while Python converts. This keeps Render's proxy from issuing a 502.
+// Response is a single JSON object at the end containing base64 file data.
+function convertWithKeepAlive(req, res, type, ext) {
+  if (!req.file) {
+    return res.status(400).json({ ok: false, error: 'No file uploaded.' });
+  }
+  if (req.file.mimetype !== 'application/pdf') {
+    return res.status(400).json({ ok: false, error: 'PDF files only.' });
+  }
 
-  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'pdfword-'));
+  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), `pdf${type}-`));
   const inFile  = path.join(tmpDir, 'input.pdf');
-  const outFile = path.join(tmpDir, 'output.docx');
+  const outFile = path.join(tmpDir, `output.${ext}`);
 
-  console.log(`[word] ${req.file.originalname} (${(req.file.size/1024).toFixed(1)} KB)`);
+  console.log(`[${type}] ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`);
   fs.writeFileSync(inFile, req.file.buffer);
 
-  const cmd = `python3 "${path.join(__dirname, 'convert.py')}" word "${inFile}" "${outFile}"`;
+  // Open a chunked stream so Render proxy sees data flowing right away
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');   // disable nginx buffering on Render
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();                           // push headers to client NOW
+
+  // Heartbeat: write a space every 5 seconds to prevent idle timeout
+  const heartbeat = setInterval(() => {
+    try { res.write(' '); } catch (_) { clearInterval(heartbeat); }
+  }, 5000);
+
+  const cmd = `python3 "${path.join(__dirname, 'convert.py')}" ${type} "${inFile}" "${outFile}"`;
   console.log(`[cmd] ${cmd}`);
 
-  exec(cmd, { timeout: 120000 }, (err, stdout, stderr) => {
-    console.log(`[stdout] ${stdout}`);
+  exec(cmd, { timeout: 180000 }, (err, stdout, stderr) => {
+    clearInterval(heartbeat);
+    if (stdout) console.log(`[stdout] ${stdout}`);
     if (stderr) console.log(`[stderr] ${stderr}`);
+
     if (err || !fs.existsSync(outFile)) {
+      const errMsg = stderr?.trim() || err?.message || 'Conversion failed';
+      console.error(`[error] ${errMsg}`);
       cleanup(tmpDir);
-      return res.status(500).json({ error: stderr?.trim() || err?.message || 'Conversion failed' });
+      res.end(JSON.stringify({ ok: false, error: errMsg }));
+      return;
     }
-    const result = fs.readFileSync(outFile);
-    const outName = req.file.originalname.replace(/\.pdf$/i, '.docx');
-    cleanup(tmpDir);
-    res.set({ 'Content-Type': MIME.docx, 'Content-Disposition': `attachment; filename="${outName}"`, 'Content-Length': result.length });
-    res.send(result);
-    console.log(`[done] ${outName} (${(result.length/1024).toFixed(1)} KB)`);
+
+    try {
+      const fileBytes = fs.readFileSync(outFile);
+      const outName   = req.file.originalname.replace(/\.pdf$/i, `.${ext}`);
+      cleanup(tmpDir);
+
+      // Send the file as base64 inside JSON — avoids binary streaming issues
+      const payload = JSON.stringify({
+        ok:       true,
+        filename: outName,
+        mime:     MIME[ext],
+        data:     fileBytes.toString('base64'),
+      });
+      res.end(payload);
+      console.log(`[done] ${outName} (${(fileBytes.length / 1024).toFixed(1)} KB)`);
+    } catch (readErr) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: readErr.message }));
+    }
   });
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'PDF Studio Server', version: '3.0.0' });
+});
+
+app.get('/ping', (req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
+
+app.post('/convert/word',  upload.single('file'), (req, res) => {
+  convertWithKeepAlive(req, res, 'word', 'docx');
 });
 
 app.post('/convert/excel', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
-  if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'PDF only.' });
-
-  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'pdfexcel-'));
-  const inFile  = path.join(tmpDir, 'input.pdf');
-  const outFile = path.join(tmpDir, 'output.xlsx');
-
-  console.log(`[excel] ${req.file.originalname} (${(req.file.size/1024).toFixed(1)} KB)`);
-  fs.writeFileSync(inFile, req.file.buffer);
-
-  const cmd = `python3 "${path.join(__dirname, 'convert.py')}" excel "${inFile}" "${outFile}"`;
-  console.log(`[cmd] ${cmd}`);
-
-  exec(cmd, { timeout: 120000 }, (err, stdout, stderr) => {
-    console.log(`[stdout] ${stdout}`);
-    if (stderr) console.log(`[stderr] ${stderr}`);
-    if (err || !fs.existsSync(outFile)) {
-      cleanup(tmpDir);
-      return res.status(500).json({ error: stderr?.trim() || err?.message || 'Conversion failed' });
-    }
-    const result = fs.readFileSync(outFile);
-    const outName = req.file.originalname.replace(/\.pdf$/i, '.xlsx');
-    cleanup(tmpDir);
-    res.set({ 'Content-Type': MIME.xlsx, 'Content-Disposition': `attachment; filename="${outName}"`, 'Content-Length': result.length });
-    res.send(result);
-    console.log(`[done] ${outName}`);
-  });
+  convertWithKeepAlive(req, res, 'excel', 'xlsx');
 });
 
-app.post('/convert/pptx', upload.single('file'), (req, res) => {
-  res.status(501).json({ error: 'PDF to PowerPoint coming soon. Use PDF to Word for now.' });
+app.post('/convert/pptx', (req, res) => {
+  res.status(501).json({ ok: false, error: 'PDF to PowerPoint coming soon.' });
 });
 
+// ── Start ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`PDF Studio Server v2 running on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`PDF Studio Server v3 running on port ${PORT}`);
 });
