@@ -100,18 +100,21 @@ function convertWithKeepAlive(req, res, type, ext) {
 
     try {
       const fileBytes = fs.readFileSync(outFile);
-      const outName   = req.file.originalname.replace(/\.pdf$/i, `.${ext}`);
+      // Sanitize filename — decode buffer as latin1 to preserve bytes,
+      // then re-encode properly. Also strip non-ASCII for safe Content-Disposition.
+      const rawName   = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+      const safeName  = rawName.replace(/\.pdf$/i, `.${ext}`);
       cleanup(tmpDir);
 
       // Send the file as base64 inside JSON — avoids binary streaming issues
       const payload = JSON.stringify({
         ok:       true,
-        filename: outName,
+        filename: safeName,
         mime:     MIME[ext],
         data:     fileBytes.toString('base64'),
       });
       res.end(payload);
-      console.log(`[done] ${outName} (${(fileBytes.length / 1024).toFixed(1)} KB)`);
+      console.log(`[done] ${safeName} (${(fileBytes.length / 1024).toFixed(1)} KB)`);
     } catch (readErr) {
       cleanup(tmpDir);
       res.end(JSON.stringify({ ok: false, error: readErr.message }));
