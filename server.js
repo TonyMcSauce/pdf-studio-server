@@ -10,9 +10,45 @@ const os       = require('os');
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
-app.use(cors());
-app.options('*', cors());
+// ── CORS — must be first, before everything else ──
+const ALLOWED_ORIGINS = [
+  'https://tonymcsauce.github.io',
+  'http://localhost:3000',
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+];
+
+const corsOptions = {
+  origin: (origin, cb) => {
+    // Allow requests with no origin (curl, Postman, server-to-server)
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept'],
+  exposedHeaders: ['Content-Disposition'],
+  credentials: false,
+  optionsSuccessStatus: 200, // IE11 chokes on 204
+};
+
+// Handle ALL OPTIONS preflight requests immediately — before multer, before anything
+app.options('*', (req, res) => {
+  const origin = req.headers.origin;
+  if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+    res.set('Access-Control-Allow-Origin', origin || '*');
+  }
+  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  res.set('Access-Control-Max-Age', '86400'); // cache preflight for 24h
+  res.sendStatus(200);
+});
+
+app.use(cors(corsOptions));
 app.use(express.json());
+
+// ── Keep-alive ping endpoint (call from frontend every 10 min to prevent spin-down) ──
+app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
 
 function cleanup(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
