@@ -143,6 +143,52 @@ app.post('/convert/pptx', (req, res) => {
   res.status(501).json({ ok: false, error: 'PDF to PowerPoint coming soon.' });
 });
 
+// ── Encrypt PDF ────────────────────────────────────────────────────────────
+app.post('/encrypt', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded.' });
+  if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ ok: false, error: 'PDF files only.' });
+
+  const userPwd  = (req.body.userPassword  || '').trim();
+  const ownerPwd = (req.body.ownerPassword || userPwd).trim();
+  if (!userPwd) return res.status(400).json({ ok: false, error: 'User password required.' });
+
+  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'pdfenc-'));
+  const inFile  = path.join(tmpDir, 'input.pdf');
+  const outFile = path.join(tmpDir, 'encrypted.pdf');
+  fs.writeFileSync(inFile, req.file.buffer);
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+
+  const heartbeat = setInterval(() => {
+    try { res.write(' '); } catch (_) { clearInterval(heartbeat); }
+  }, 5000);
+
+  const scriptPath = path.join(__dirname, 'convert.py');
+  // Pass passwords as JSON-escaped CLI args — safe for all special chars
+  const cmd = `python3 "${scriptPath}" encrypt "${inFile}" "${outFile}" ${JSON.stringify(userPwd)} ${JSON.stringify(ownerPwd)}`;
+
+  exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+    clearInterval(heartbeat);
+    if (err || !fs.existsSync(outFile)) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: stderr?.trim() || err?.message || 'Encryption failed' }));
+      return;
+    }
+    try {
+      const fileBytes = fs.readFileSync(outFile);
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: true, data: fileBytes.toString('base64'), filename: 'protected.pdf', mime: 'application/pdf' }));
+    } catch (e) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  });
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
