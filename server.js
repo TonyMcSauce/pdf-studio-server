@@ -143,7 +143,7 @@ app.post('/convert/pptx', (req, res) => {
   res.status(501).json({ ok: false, error: 'PDF to PowerPoint coming soon.' });
 });
 
-// ── Encrypt PDF ────────────────────────────────────────────────────────────
+// ── Encrypt PDF (add password) ─────────────────────────────────────────────
 app.post('/encrypt', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded.' });
   if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ ok: false, error: 'PDF files only.' });
@@ -182,6 +182,52 @@ app.post('/encrypt', upload.single('file'), (req, res) => {
       const fileBytes = fs.readFileSync(outFile);
       cleanup(tmpDir);
       res.end(JSON.stringify({ ok: true, data: fileBytes.toString('base64'), filename: 'protected.pdf', mime: 'application/pdf' }));
+    } catch (e) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  });
+});
+
+// ── Decrypt PDF (remove password) ───────────────────────────────────────────
+app.post('/decrypt', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded.' });
+  if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ ok: false, error: 'PDF files only.' });
+
+  const currentPwd = (req.body.password || '').trim();
+
+  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'pdfdec-'));
+  const inFile  = path.join(tmpDir, 'input.pdf');
+  const outFile = path.join(tmpDir, 'decrypted.pdf');
+  fs.writeFileSync(inFile, req.file.buffer);
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+
+  const heartbeat = setInterval(() => {
+    try { res.write(' '); } catch (_) { clearInterval(heartbeat); }
+  }, 5000);
+
+  const scriptPath = path.join(__dirname, 'convert.py');
+  const cmd = `python3 "${scriptPath}" decrypt "${inFile}" "${outFile}" ${JSON.stringify(currentPwd)}`;
+
+  exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+    clearInterval(heartbeat);
+    if (err || !fs.existsSync(outFile)) {
+      cleanup(tmpDir);
+      const msg = stderr?.trim() || err?.message || 'Decryption failed';
+      // Surface wrong-password cases distinctly so the frontend can prompt again.
+      const isBadPwd = /incorrect password/i.test(msg);
+      res.end(JSON.stringify({ ok: false, error: isBadPwd ? 'Incorrect password.' : msg }));
+      return;
+    }
+    try {
+      const fileBytes = fs.readFileSync(outFile);
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: true, data: fileBytes.toString('base64'), filename: 'unlocked.pdf', mime: 'application/pdf' }));
     } catch (e) {
       cleanup(tmpDir);
       res.end(JSON.stringify({ ok: false, error: e.message }));
