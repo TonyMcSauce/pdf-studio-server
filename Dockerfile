@@ -12,18 +12,14 @@ RUN apt-get update && \
       fonts-dejavu \
       fontconfig \
       --no-install-recommends && \
-    pip3 install --break-system-packages pdf2docx pdfplumber openpyxl && \
+    pip3 install --break-system-packages pdf2docx pdfplumber openpyxl pikepdf && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
 COPY package.json .
 RUN npm install --production
-
 COPY server.js .
 COPY convert.py .
-
 EXPOSE 3000
-
 CMD ["node", "server.js"]
