@@ -12,7 +12,7 @@ RUN apt-get update && \
       fonts-dejavu \
       fontconfig \
       --no-install-recommends && \
-    pip3 install --break-system-packages pdf2docx pdfplumber openpyxl pikepdf && \
+    pip3 install --break-system-packages pdf2docx pdfplumber openpyxl pikepdf pymupdf && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
