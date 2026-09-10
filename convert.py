@@ -163,12 +163,58 @@ def _hex_to_rgb01(hex_str):
     return _color_int_to_rgb01(int(hex_str, 16))
 
 
+def _sample_background_color(page, rect, margin=2):
+    """Best-effort background color for a text box, sampled BEFORE that
+    box is redacted (once redacted, the pixels are already blank, so this
+    has to run first). Renders a small region around the box and picks
+    the most common pixel color rather than a single point sample, since
+    the background dominates the box and a single sampled pixel could
+    easily land on a stray bit of ink. Falls back to white on any
+    failure — a wrong-but-plausible guess beats a crash."""
+    import fitz  # local import — this file scopes fitz per-function so CLI
+                 # modes that don't need it (word/excel/encrypt/decrypt) stay light
+    try:
+        clip = fitz.Rect(rect.x0 - margin, rect.y0 - margin, rect.x1 + margin, rect.y1 + margin) & page.rect
+        if clip.is_empty:
+            return (1, 1, 1)
+        pix = page.get_pixmap(clip=clip, dpi=72)
+        samples, n = pix.samples, pix.n
+        total_px = pix.width * pix.height
+        if total_px == 0:
+            return (1, 1, 1)
+        step = max(1, total_px // 400)  # cap sampling cost on larger boxes
+        from collections import Counter
+        counts = Counter()
+        for i in range(0, len(samples) - n + 1, n * step):
+            counts[(samples[i], samples[i + 1], samples[i + 2])] += 1
+        if not counts:
+            return (1, 1, 1)
+        (r, g, b), _ = counts.most_common(1)[0]
+        return (r / 255.0, g / 255.0, b / 255.0)
+    except Exception:
+        return (1, 1, 1)
+
+
+def _font_descender_fraction(fontname):
+    """Real per-font descender (fraction of 1 em, e.g. Helvetica ≈ -0.207)
+    for accurate baseline placement, instead of one guessed constant that
+    doesn't account for how fonts actually differ."""
+    import fitz
+    try:
+        return abs(fitz.Font(fontname).descender)
+    except Exception:
+        return 0.2  # reasonable generic fallback if metrics aren't available
+
+
 def apply_text_edits(input_pdf, output_pdf, edits_json_path):
     """Each edit genuinely removes the old text (via real redaction, not
     a box painted on top) and draws the replacement in its place. No
     reflow: if the new text is wider than the original box, font size
     auto-shrinks down to a floor of 60% of the original size, then clips
-    — the same documented behavior as every other "quick edit" PDF tool."""
+    — the same documented behavior as every other "quick edit" PDF tool.
+    The redacted area is filled with the page's own sampled background
+    color (not hardcoded white), and the replacement's baseline uses the
+    actual font's descender metric rather than a flat approximation."""
     import fitz
     with open(edits_json_path, "r", encoding="utf-8") as f:
         edits = json.load(f)
@@ -180,14 +226,19 @@ def apply_text_edits(input_pdf, output_pdf, edits_json_path):
 
     for pno, page_edits in by_page.items():
         page = doc[pno]
-        # Redact every edited span's original box first — white fill so
-        # it blends with a normal page background (good enough for v1;
-        # a future version could sample the actual background color).
+
+        # Sample every edit's background BEFORE any redaction touches this
+        # page — order matters, once apply_redactions() runs, the "before"
+        # pixels are gone for every box on the page, not just the one that
+        # triggered it.
+        bg_fills = []
         for e in page_edits:
-            page.add_redact_annot(fitz.Rect(*e["bbox"]), fill=(1, 1, 1))
+            rect = fitz.Rect(*e["bbox"])
+            bg_fills.append(_sample_background_color(page, rect))
+            page.add_redact_annot(rect, fill=bg_fills[-1])
         page.apply_redactions()
 
-        for e in page_edits:
+        for e, bg in zip(page_edits, bg_fills):
             new_text = (e.get("newText") or "").strip()
             if not new_text:
                 continue
@@ -210,12 +261,8 @@ def apply_text_edits(input_pdf, output_pdf, edits_json_path):
             # text won't cleanly fit, which is exactly what was happening:
             # PyMuPDF's span bboxes are cropped tight to the glyph ink with
             # no line-height padding, so insert_textbox kept rejecting
-            # perfectly reasonable single-line replacements. A blank white
-            # box (successfully redacted, replacement silently dropped) is
-            # a much worse failure mode than an imperfectly-positioned line
-            # of text, so this trades a small vertical-alignment
-            # approximation for the replacement text actually appearing.
-            baseline_y = rect.y1 - fit_size * 0.15
+            # perfectly reasonable single-line replacements.
+            baseline_y = rect.y1 - _font_descender_fraction(fontname) * fit_size
             page.insert_text((rect.x0, baseline_y), new_text, fontsize=fit_size, fontname=fontname, color=color)
 
     doc.save(output_pdf)
