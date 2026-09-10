@@ -204,7 +204,19 @@ def apply_text_edits(input_pdf, output_pdf, edits_json_path):
                     break
                 fit_size -= 0.5
 
-            page.insert_textbox(rect, new_text, fontsize=fit_size, fontname=fontname, color=color, align=0)
+            # insert_text() draws at an exact baseline point rather than
+            # trying to "fit" into a box — insert_textbox() was used here
+            # originally, but it silently draws NOTHING when it judges the
+            # text won't cleanly fit, which is exactly what was happening:
+            # PyMuPDF's span bboxes are cropped tight to the glyph ink with
+            # no line-height padding, so insert_textbox kept rejecting
+            # perfectly reasonable single-line replacements. A blank white
+            # box (successfully redacted, replacement silently dropped) is
+            # a much worse failure mode than an imperfectly-positioned line
+            # of text, so this trades a small vertical-alignment
+            # approximation for the replacement text actually appearing.
+            baseline_y = rect.y1 - fit_size * 0.15
+            page.insert_text((rect.x0, baseline_y), new_text, fontsize=fit_size, fontname=fontname, color=color)
 
     doc.save(output_pdf)
     doc.close()
